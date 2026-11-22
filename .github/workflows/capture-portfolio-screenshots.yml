@@ -1,0 +1,78 @@
+name: Capture portfolio screenshots
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/capture-portfolio-screenshots.yml
+permissions:
+  contents: read
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install application and browser dependencies
+        run: |
+          python -m pip install -r requirements.txt playwright
+          python -m playwright install --with-deps chromium
+      - name: Start genuine FastAPI backend
+        run: |
+          python scripts/setup_demo.py >/dev/null
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/finpilot-backend.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/health > /dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health > /dev/null
+      - name: Seed synthetic demonstration workflow
+        run: |
+          python - <<'PY'
+          import requests
+          from dotenv import dotenv_values
+          u='http://127.0.0.1:8000'
+          customers=requests.get(u+'/customers').json()
+          customer_id=customers[0]['id']
+          for n,amount in [('101',250000),('102',480000),('103',150000)]:
+              r=requests.post(u+'/requests',json=dict(customer_id=customer_id,external_reference='PORT-DEMO-'+n,amount_cents=amount,description='Synthetic demonstration services',idempotency_key='portfolio-demo-'+n))
+              r.raise_for_status()
+              if n=='101':
+                  token=dotenv_values('.env')['APP_APPROVAL_TOKEN']
+                  d=requests.post(u+'/requests/'+str(r.json()['id'])+'/decision',json={'decision':'approve'},headers={'X-Approval-Token':token})
+                  d.raise_for_status()
+          PY
+      - name: Screenshot actual running dashboard
+        run: |
+          mkdir -p screenshots
+          python - <<'PY'
+          import asyncio
+          from playwright.async_api import async_playwright
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(args=['--disable-dev-shm-usage'])
+                  page=await browser.new_page(viewport={'width':1440,'height':960},device_scale_factor=1)
+                  await page.goto('http://127.0.0.1:8000/',wait_until='networkidle')
+                  await page.wait_for_function("!document.querySelector('#stats-grid .skeleton')",timeout=15000)
+                  await page.screenshot(path='screenshots/FinPilot-Overview-Desktop.png',full_page=True)
+                  for key,label in [('approvals','Approvals'),('copilot','Copilot'),('audit','Audit')]:
+                      await page.locator('button[data-page="'+key+'"]').click()
+                      await page.wait_for_timeout(400)
+                      await page.screenshot(path='screenshots/FinPilot-'+label+'-Desktop.png',full_page=True)
+                  mobile=await browser.new_page(viewport={'width':390,'height':844},device_scale_factor=2)
+                  await mobile.goto('http://127.0.0.1:8000/',wait_until='networkidle')
+                  await mobile.wait_for_function("!document.querySelector('#stats-grid .skeleton')",timeout=15000)
+                  await mobile.screenshot(path='screenshots/FinPilot-Overview-Mobile.png',full_page=True)
+                  await browser.close()
+          asyncio.run(main())
+          PY
+      - name: Upload original browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finpilot-portfolio-screenshots
+          path: screenshots/
+          if-no-files-found: warn
